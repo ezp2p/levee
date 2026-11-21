@@ -71,7 +71,26 @@ Apache:
 </VirtualHost>
 ```
 
-nginx: `proxy_pass https://127.0.0.1:8443;` with `proxy_read_timeout 75s;` and `proxy_request_buffering off;`.
+nginx:
+
+```nginx
+location / {
+    proxy_pass https://127.0.0.1:8443;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_read_timeout 75s;
+    proxy_request_buffering off;
+    client_max_body_size 64m;   # nginx refuses more than 1 MB by default; files go up in 1 MB pieces, plus sealing
+}
+```
+
+Tell leveed which proxies to believe (`trusted_proxies`, below), so it can tell strangers apart: it lets a few first
+contacts through from each address, and without it everyone arrives from the proxy's and shares one allowance. The Docker
+image believes the private ranges, where Docker hands over a proxy's requests, unless `LEVEE_TRUSTED_PROXIES` says otherwise
+(`none` for none). Apache sends `X-Forwarded-For` by itself.
+
+The proxy sees no more than the Levee does: what passes is sealed end to end or signed, so it can neither read it nor
+change it unnoticed. Like the Levee it sees who talks to your Puddle, when and how much.
 
 ### Without Docker
 
@@ -99,6 +118,7 @@ build/leveed -c levee.yaml
 | `threads` | 2 | |
 | `spool.max_mb`, `spool.keep_days` | 1024, 30 | what waits for your Puddle while it is off; the oldest goes first |
 | `files.max_mb`, `files.total_mb`, `files.keep_days` | 100, 4096, 30 | files left for friends |
+| `trusted_proxies` | none | reverse proxies in front (`[127.0.0.1, 172.16.0.0/12]`): a request from one is taken to come from the address its `X-Forwarded-For` names |
 | `turn.port`, `turn.relay_ports`, `turn.public_ip` | 3478, `49160-49199`, the address's host | the relay for calls (UDP); `turn: false` turns it off |
 
 ## leveectl
@@ -118,5 +138,5 @@ so strangers get nowhere), `spool/` and `files/`.
 
 ## Tests
 
-`ctest --test-dir build`: `store` (the data folder), `turn` (the relay, as a TURN client and a peer meet it) and `levee`
+`ctest --test-dir build`: `config` (levee.yaml, and where a request comes from behind a proxy), `store` (the data folder), `turn` (the relay, as a TURN client and a peer meet it) and `levee`
 (leveed as a Puddle and its friends meet it: joining, spooling, passing through, sending, files, leaving).
