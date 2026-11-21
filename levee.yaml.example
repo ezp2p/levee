@@ -1,0 +1,28 @@
+# levee.yaml: one Levee for one Puddle (README.md).
+
+# Where leveed listens for HTTPS. Put a reverse proxy (Apache, nginx, Caddy, ...) in front if you like: any certificate
+# works, the Puddle Protocol doesn't look at them.
+listen: 0.0.0.0
+port: 8443
+
+# How others reach your Puddle: what its links will say. Required.
+address: levee.example.org:443
+
+# The Levee's key, its certificate (self-signed unless you put your own) and what it keeps.
+data_dir: /var/lib/levee
+
+# threads: 2
+
+spool:              # requests for your Puddle that came while it was off
+  max_mb: 1024
+  keep_days: 30
+files:              # files your Puddle left for friends, until each has fetched them
+  max_mb: 100       # the largest one
+  total_mb: 4096
+  keep_days: 30
+
+# The relay for calls: UDP, published directly (a reverse proxy doesn't carry it). `turn: false` turns it off.
+turn:
+  port: 3478
+  relay_ports: 49160-49199
+  # public_ip: 203.0.113.7   # what relayed addresses say; default: the address's host, looked up

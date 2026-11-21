@@ -1,0 +1,39 @@
+name: build
+
+# Build and test the Levee on every pull request and push. What is downloaded is the container image, from docker.yml.
+
+on:
+  push:
+    branches: [dev, main]
+    tags: ['[0-9]*.[0-9]*.[0-9]*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      # the submodule third_party/protocol: libpuddle-proto
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build libssl-dev libjsoncpp-dev libyaml-cpp-dev uuid-dev zlib1g-dev
+
+      - name: Build
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --parallel 4
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
