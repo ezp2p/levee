@@ -6,6 +6,8 @@
 #   LEVEE_TURN_PORT    the relay's UDP port (default 3478)
 #   LEVEE_RELAY_PORTS  the relayed UDP ports (default 49160-49199)
 #   LEVEE_PUBLIC_IP    the server's public IPv4 address, for calls (default: LEVEE_ADDRESS's host, looked up)
+#   LEVEE_TRUSTED_PROXIES  the reverse proxies in front, whose X-Forwarded-For is believed, space-separated (default: the
+#                      private ranges, where Docker puts a proxy on this host or in another container); "none" for none
 # Arguments go to leveed.
 set -eu
 cd /data
@@ -33,6 +35,15 @@ if [ ! -e "$config" ]; then
         echo "  max_mb: 100      # the largest file your Puddle may leave here for friends"
         echo "  total_mb: 4096"
         echo "  keep_days: 30"
+        echo
+        proxies=${LEVEE_TRUSTED_PROXIES:-127.0.0.1 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16}
+        if [ "$proxies" = none ]; then
+            echo "# trusted_proxies: [127.0.0.1]   # reverse proxies whose X-Forwarded-For is believed"
+        else
+            echo "# Reverse proxies whose X-Forwarded-For is believed: Docker hands a proxy's requests over from these ranges."
+            echo "trusted_proxies:"
+            for p in $proxies; do echo "  - $(quote "$p")"; done
+        fi
         echo
         echo "# The relay for calls: published directly (not through the proxy), UDP."
         echo "turn:"

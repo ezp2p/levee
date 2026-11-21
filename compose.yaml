@@ -12,6 +12,7 @@ services:
     environment:
       LEVEE_ADDRESS: ${LEVEE_ADDRESS:?set LEVEE_ADDRESS, how others reach your Puddle}
       LEVEE_PUBLIC_IP: ${LEVEE_PUBLIC_IP:-}
+      LEVEE_TRUSTED_PROXIES: ${LEVEE_TRUSTED_PROXIES:-}
     ports:
       - "127.0.0.1:8443:8443"
       - "3478:3478/udp"

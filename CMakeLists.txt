@@ -85,7 +85,7 @@ install(TARGETS leveed leveectl RUNTIME DESTINATION bin)
 enable_testing()
 # e2e needs a built Puddle (puddled) to put behind the Levee: a separate program, found at PUDDLED; skipped without one
 set(PUDDLED "${CMAKE_CURRENT_SOURCE_DIR}/../puddle/build/puddled" CACHE FILEPATH "a built puddled, for the end-to-end test")
-foreach(t store turn levee e2e)
+foreach(t config store turn levee e2e)
   add_executable(${t}_test tests/${t}_test.cpp)
   target_link_libraries(${t}_test PRIVATE levee_lib OpenSSL::SSL)
   target_compile_options(${t}_test PRIVATE -Wall -Wextra)

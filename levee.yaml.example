@@ -13,6 +13,11 @@ data_dir: /var/lib/levee
 
 # threads: 2
 
+# Reverse proxies in front of leveed (addresses or ranges). A request from one of them is taken to come from the address
+# it names in X-Forwarded-For, so strangers are rate-limited each on their own rather than all as the proxy. Leave it out
+# with no proxy: then nobody can claim another address.
+# trusted_proxies: [127.0.0.1, "::1"]
+
 spool:              # requests for your Puddle that came while it was off
   max_mb: 1024
   keep_days: 30

@@ -279,7 +279,7 @@ void Levee::incoming(const HttpRequestPtr &req, Callback &&cb)
                 LOG_INFO << m << " " << path << " from " << sig.id << ": " << (int)a << (attached_now(now) ? ", the Puddle is here" : ", the Puddle is away");
         }
         if (!ok && first_contact_route(m, path)) {
-            std::string ip = req->peerAddr().toIp();
+            std::string ip = client_address(cfg_.trusted_proxies, req->peerAddr().toIp(), req->getHeader("x-forwarded-for"));
             auto b = stranger_ips_.try_emplace(ip, 10, 6000).first;
             ok = strangers_.take(now) && b->second.take(now);
             if (stranger_ips_.size() > 4096)
