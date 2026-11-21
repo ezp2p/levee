@@ -64,9 +64,9 @@ public:
 
     /* how long a request for the Puddle waits for its answer, and an inbox request for something to hand over (tests shorten
      * them) */
-    int64_t answer_wait_ms = 30000;
+    int64_t answer_wait_ms = 8000; /* under a Puddle's 10 s wait for any reply, so a one-way request is kept before its caller gives up */
     int64_t inbox_wait_ms = 25000;
-    int64_t attached_ms = 30000;
+    int64_t attached_ms = 10000; /* since the Puddle's last inbox request, when none is waiting now */
 
 private:
     struct Waiting {
@@ -79,6 +79,7 @@ private:
         uint64_t after = 0;
         Callback cb;
         int64_t deadline = 0;
+        drogon::HttpRequestPtr req; /* so a Puddle that went away (its connection closed) isn't counted as there */
     };
 
     void incoming(const drogon::HttpRequestPtr &req, Callback &&cb);
@@ -103,6 +104,8 @@ private:
     /* hand what is new to whoever waits on inbox; locked, the callbacks to call collected in `out` */
     void wake_polls(std::vector<std::pair<Callback, drogon::HttpResponsePtr>> &out);
     bool attached_now(int64_t now) const;
+    /* spool a live request nobody answered, if it is one-way: the custody receipt for its caller, or nullptr. Locked. */
+    drogon::HttpResponsePtr spool_with_custody(const Item &it);
     bool puddle_key(unsigned char pub[32]) const;
     void load_puddle_key();
 

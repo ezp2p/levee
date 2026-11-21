@@ -21,6 +21,13 @@ static constexpr size_t INBOX_MAX_ITEMS = 64;
 static constexpr size_t INBOX_MAX_BYTES = 4 << 20;
 static constexpr size_t SEND_MAX_ANSWER = 32 << 20;
 
+/* LEVEE_LOG=debug: say why each request for the Puddle was refused or kept */
+static bool debug_log()
+{
+    static const bool on = getenv("LEVEE_LOG") && !strcmp(getenv("LEVEE_LOG"), "debug");
+    return on;
+}
+
 bool Bucket::take(int64_t now)
 {
     if (at_ == 0)
@@ -161,7 +168,29 @@ bool Levee::puddle_key(unsigned char pub[32]) const
 
 bool Levee::attached_now(int64_t now) const
 {
-    return !polls_.empty() || (last_poll_ && now - last_poll_ < attached_ms);
+    for (const Poll &p : polls_)
+        if (p.req && p.req->connected())
+            return true;
+    return last_poll_ && now - last_poll_ < attached_ms;
+}
+
+HttpResponsePtr Levee::spool_with_custody(const Item &in)
+{
+    std::string path = in.target.substr(0, in.target.find('?'));
+    const Join &j = store_.join();
+    if (j.puddle.empty() || !one_way_route(in.method, path) || store_.spooled_nonce(in.sender, in.nonce) ||
+        store_.spool_bytes() + in.body.size() + 4096 > cfg_.spool_max_bytes)
+        return nullptr;
+    Item it = in;
+    it.live = false;
+    pp_signer s;
+    pp_signer_from_seed(&s, key_.id.c_str(), key_.seed);
+    char custody[PP_CUSTODY_MAX];
+    if (pp_custody_sign(&s, j.puddle.c_str(), it.nonce.c_str(), sha256_hex(it.body).c_str(), custody, sizeof custody) != 0 || !store_.spool(it))
+        return nullptr;
+    auto r = status_only(202);
+    r->addHeader("X-Puddle-Custody", custody);
+    return r;
 }
 
 void Levee::handle(const HttpRequestPtr &req, Callback &&cb)
@@ -246,6 +275,8 @@ void Levee::incoming(const HttpRequestPtr &req, Callback &&cb)
             pp_authn a = pp_reqsig_authenticate(sig_header.c_str(), m.c_str(), target.c_str(), req->body().data(), req->body().size(),
                                                 j.puddle.c_str(), lookup, &look, nullptr, now, nullptr);
             ok = a == PP_AUTHN_OK || a == PP_AUTHN_SKEW; /* the Puddle says what is wrong with the clock, as it would */
+            if (debug_log())
+                LOG_INFO << m << " " << path << " from " << sig.id << ": " << (int)a << (attached_now(now) ? ", the Puddle is here" : ", the Puddle is away");
         }
         if (!ok && first_contact_route(m, path)) {
             std::string ip = req->peerAddr().toIp();
@@ -254,8 +285,10 @@ void Levee::incoming(const HttpRequestPtr &req, Callback &&cb)
             if (stranger_ips_.size() > 4096)
                 stranger_ips_.clear();
         }
-        if (!ok)
+        if (!ok) {
+            if (debug_log()) LOG_INFO << "refused " << m << " " << path << " from " << sig.id << (known == store_.peers().end() ? " (not a peer)" : " (signature)");
             return cb(not_found());
+        }
 
         Item it;
         it.n = store_.next_n();
@@ -279,20 +312,11 @@ void Levee::incoming(const HttpRequestPtr &req, Callback &&cb)
             w.deadline = now + answer_wait_ms;
             live_.emplace(w.item.n, std::move(w));
             wake_polls(later);
-        } else if (one_way_route(m, path) && !store_.spooled_nonce(sig.id, sig.nonce) &&
-                   store_.spool_bytes() + it.body.size() + 4096 <= cfg_.spool_max_bytes) {
-            pp_signer s;
-            pp_signer_from_seed(&s, key_.id.c_str(), key_.seed);
-            char custody[PP_CUSTODY_MAX];
-            std::string bh = sha256_hex(it.body);
-            if (pp_custody_sign(&s, j.puddle.c_str(), sig.nonce, bh.c_str(), custody, sizeof custody) != 0 || !store_.spool(it)) {
-                now_answer = not_found();
-            } else {
-                now_answer = status_only(202);
-                now_answer->addHeader("X-Puddle-Custody", custody);
-            }
         } else {
-            now_answer = not_found();
+            now_answer = spool_with_custody(it);
+            if (debug_log()) LOG_INFO << (now_answer ? "kept " : "the Puddle is away, refused ") << m << " " << path << " from " << sig.id;
+            if (!now_answer)
+                now_answer = not_found();
         }
     }
     for (auto &[c, r] : later)
@@ -573,6 +597,7 @@ void Levee::inbox(const HttpRequestPtr &req, Callback &&cb)
     p.after = after;
     p.cb = std::move(cb);
     p.deadline = now + inbox_wait_ms;
+    p.req = req;
     polls_.push_back(std::move(p));
 }
 
@@ -608,6 +633,8 @@ void Levee::answer(const HttpRequestPtr &req, uint64_t n, Callback &&cb)
         if (status < 100 || status > 599)
             return cb(status_only(400));
         waiting = std::move(w->second.cb);
+        if (debug_log())
+            LOG_INFO << "the Puddle answered " << n << ": " << status;
         live_.erase(w);
         out = passed(status, std::string(req->getHeader("content-type")), std::string(req->getHeader("x-puddle-receipt")), "",
                      std::string(req->getHeader("content-range")), std::string(req->body()));
@@ -806,7 +833,11 @@ void Levee::tick()
         int64_t now = wall_ms();
         for (auto it = live_.begin(); it != live_.end();) {
             if (it->second.deadline <= now) {
-                later.emplace_back(std::move(it->second.cb), not_found());
+                /* the Puddle didn't answer (it went away meanwhile): a one-way request is kept for it, as if it had been away */
+                HttpResponsePtr kept = spool_with_custody(it->second.item);
+                if (debug_log())
+                    LOG_INFO << "the Puddle didn't answer " << it->first << (it->second.handed ? " (handed over)" : "") << ": " << (kept ? "kept" : "refused");
+                later.emplace_back(std::move(it->second.cb), kept ? kept : not_found());
                 it = live_.erase(it);
             } else {
                 ++it;
@@ -814,6 +845,10 @@ void Levee::tick()
         }
         std::vector<Poll> still;
         for (Poll &p : polls_) {
+            if (p.req && !p.req->connected()) {
+                later.emplace_back(std::move(p.cb), not_found());
+                continue;
+            }
             if (p.deadline <= now) {
                 Json::Value v;
                 v["items"] = Json::Value(Json::arrayValue);

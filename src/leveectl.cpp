@@ -51,7 +51,7 @@ int main(int argc, char **argv)
         printf("Levee %s, reached at %s\n", key.id.c_str(), address_with_port(cfg.address).c_str());
         printf("Puddle: %s\n", j.puddle.empty() ? "none joined" : j.puddle.c_str());
         printf("friends and phones it knows: %zu\n", store.peers().size());
-        printf("waiting for the Puddle: %.1f MB\n", (double)store.spool_bytes() / (1 << 20));
+        printf("waiting for the Puddle: %zu (%.0f KB)\n", store.spooled_after(0, SIZE_MAX, SIZE_MAX).size(), (double)store.spool_bytes() / 1024);
         printf("files waiting for friends: %zu (%.1f MB)\n", store.files().size(), (double)store.files_bytes() / (1 << 20));
         printf("join link open: %s\n", j.token.empty() ? "no" : "yes");
         return 0;

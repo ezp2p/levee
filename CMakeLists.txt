@@ -39,7 +39,21 @@ FetchContent_Declare(drogon
 FetchContent_MakeAvailable(drogon)
 target_compile_options(trantor PRIVATE -Wno-error=deprecated-declarations)
 
-find_package(yaml-cpp REQUIRED)
+# yaml-cpp: the system's, or built here at a fixed release when there is none
+find_package(yaml-cpp QUIET)
+if(NOT yaml-cpp_FOUND)
+  set(YAML_CPP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+  set(YAML_CPP_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+  set(YAML_CPP_BUILD_CONTRIB OFF CACHE BOOL "" FORCE)
+  set(YAML_CPP_INSTALL OFF CACHE BOOL "" FORCE)
+  FetchContent_Declare(yaml-cpp
+    GIT_REPOSITORY https://github.com/jbeder/yaml-cpp.git
+    GIT_TAG 0.8.0
+    GIT_SHALLOW TRUE)
+  FetchContent_MakeAvailable(yaml-cpp)
+  # 0.8.0 leaves out <cstdint>, which newer compilers no longer bring in by themselves
+  target_compile_options(yaml-cpp PRIVATE -include cstdint)
+endif()
 if(NOT TARGET yaml-cpp::yaml-cpp AND TARGET yaml-cpp)
   add_library(yaml-cpp::yaml-cpp ALIAS yaml-cpp)
 endif()
@@ -69,12 +83,15 @@ target_link_libraries(leveectl PRIVATE levee_lib)
 install(TARGETS leveed leveectl RUNTIME DESTINATION bin)
 
 enable_testing()
-foreach(t store turn levee)
+# e2e needs a built Puddle (puddled) to put behind the Levee: a separate program, found at PUDDLED; skipped without one
+set(PUDDLED "${CMAKE_CURRENT_SOURCE_DIR}/../puddle/build/puddled" CACHE FILEPATH "a built puddled, for the end-to-end test")
+foreach(t store turn levee e2e)
   add_executable(${t}_test tests/${t}_test.cpp)
   target_link_libraries(${t}_test PRIVATE levee_lib OpenSSL::SSL)
   target_compile_options(${t}_test PRIVATE -Wall -Wextra)
-  target_compile_definitions(${t}_test PRIVATE LEVEE_BIN_DIR="${CMAKE_CURRENT_BINARY_DIR}")
+  target_compile_definitions(${t}_test PRIVATE LEVEE_BIN_DIR="${CMAKE_CURRENT_BINARY_DIR}" PUDDLED="${PUDDLED}")
   add_test(NAME ${t} COMMAND ${t}_test)
-  set_tests_properties(${t} PROPERTIES TIMEOUT 180)
+  set_tests_properties(${t} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
 endforeach()
 add_dependencies(levee_test leveed leveectl)
+add_dependencies(e2e_test leveed leveectl)

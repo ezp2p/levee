@@ -13,6 +13,7 @@
 #include <netdb.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 using namespace levee;
@@ -93,7 +94,7 @@ int main(int argc, char **argv)
         app().getLoop()->runAfter(0.3, [] { app().quit(); });
     };
     app()
-        .setLogLevel(trantor::Logger::kInfo)
+        .setLogLevel(getenv("LEVEE_LOG") && !strcmp(getenv("LEVEE_LOG"), "debug") ? trantor::Logger::kDebug : trantor::Logger::kInfo)
         .addListener(cfg.listen, (uint16_t)cfg.port, true, cfg.data_dir + "/cert.pem", cfg.data_dir + "/key.pem")
         .setThreadNum(cfg.threads)
         .enableServerHeader(false)

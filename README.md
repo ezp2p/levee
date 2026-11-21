@@ -48,7 +48,7 @@ firewall.
 
 Any certificate works (Let's Encrypt, the proxy's own): the protocol never looks at certificates. Forward everything for the
 Levee's name to leveed's HTTPS port, and let requests wait: your Puddle holds one open for up to 25 seconds, and a friend's
-request waits up to 30 seconds for your Puddle's answer.
+request waits up to 8 seconds for your Puddle's answer.
 
 Apache:
 
