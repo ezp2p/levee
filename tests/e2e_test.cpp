@@ -15,7 +15,7 @@ struct Node {
     unsigned port = 0;
     pid_t pid = 0;
 
-    bool make(const std::string &root, const char *who)
+    bool make(const std::string &root, const char *who, const std::string &extra = "")
     {
         name = who;
         dir = root + "/" + who;
@@ -23,7 +23,7 @@ struct Node {
         mkdir(dir.c_str(), 0700);
         std::ofstream(dir + "/profiles.yaml") << "profiles:\n  - id: main\n    display_name: " << who << "\n";
         port = free_port();
-        std::ofstream(conf) << "address: 127.0.0.1\nport: " << port << "\ndata_dir: " << dir << "/data\nprofiles: " << dir << "/profiles.yaml\n" << (getenv("LEVEE_LOG") ? "log: debug\n" : "");
+        std::ofstream(conf) << "address: 127.0.0.1\nport: " << port << "\ndata_dir: " << dir << "/data\nprofiles: " << dir << "/profiles.yaml\n" << extra << (getenv("LEVEE_LOG") ? "log: debug\n" : "");
         std::string out = run_out(std::string(PUDDLED) + " -c " + conf + " --init < /dev/null 2>&1");
         if (access((dir + "/data/identity").c_str(), F_OK) != 0) {
             fprintf(stderr, "%s: puddled --init: %s\n", who, out.c_str());
@@ -54,6 +54,20 @@ struct Node {
     Reply call(const std::string &method, const std::string &path, const std::string &body = "")
     {
         return https(port, method, path, body, { "Authorization: Bearer " + token });
+    }
+    /* upload `bytes` as a file the owner will send, a MiB at a time: its id, or "" */
+    std::string upload(const std::string &bytes)
+    {
+        Json::Value v;
+        Reply r = call("POST", "/api/v1/files/uploads/create", "{\"size\":" + std::to_string(bytes.size()) + "}");
+        if (r.status != 201 || !parse_object(r.body, v))
+            return "";
+        std::string u = "/api/v1/files/uploads/" + v["upload"].asString();
+        for (size_t at = 0, n = 0; at < bytes.size(); at += 1 << 20, n++)
+            if (call("POST", u + "/chunks/" + std::to_string(n), bytes.substr(at, 1 << 20)).status != 200)
+                return "";
+        r = call("POST", u + "/finish", "");
+        return r.status == 201 && parse_object(r.body, v) ? v["id"].asString() : "";
     }
     Json::Value json(const std::string &method, const std::string &path, const std::string &body = "")
     {
@@ -113,7 +127,7 @@ int main()
     char tmpl[] = "/tmp/levee-e2e-XXXXXX";
     std::string root = mkdtemp(tmpl);
     Node alice, bob;
-    CHECK(alice.make(root, "alice") && bob.make(root, "bob"));
+    CHECK(alice.make(root, "alice") && bob.make(root, "bob", "files:\n  auto_download: never\n"));
     std::string a_id = id_of(alice), b_id = id_of(bob);
     CHECK(a_id.size() == 52 && b_id.size() == 52);
 
@@ -186,6 +200,36 @@ int main()
     /* ---- she comes back, and it is handed over ---- */
     CHECK(alice.up());
     CHECK(until([&] { return has_text(alice, b_id, "while you were out"); }, 40000));
+
+    /* ---- a file: left at her Levee, sealed under its own key, and fetched from there while she is away ---- */
+    std::string bytes;
+    for (int i = 0; i < (5 << 19); i++)
+        bytes.push_back((char)(i * 131 + (i >> 9)));
+    std::string file = alice.upload(bytes);
+    CHECK(file.size() == 64);
+    Json::Value msg;
+    msg["body"] = "a file for you";
+    msg["files"][0]["id"] = file;
+    msg["files"][0]["name"] = "pattern.bin";
+    msg["files"][0]["mime"] = "application/octet-stream";
+    CHECK(alice.call("POST", "/api/v1/conversations/" + b_id + "/messages/send", levee::to_json(msg)).status < 300);
+    CHECK(until([&] { return has_text(bob, a_id, "a file for you"); }, 30000));
+    CHECK(until([&] { return lv.ctl("status").find("files waiting for friends: 1") != std::string::npos; }, 30000));
+    std::string message_id;
+    {
+        Json::Value page = bob.json("GET", "/api/v1/conversations/" + a_id + "/messages?limit=50");
+        for (const Json::Value &m : page["items"])
+            if (m.isMember("body") && m["body"].asString() == "a file for you")
+                message_id = m["id"].asString();
+    }
+    alice.down();
+    CHECK(bob.call("POST", "/api/v1/conversations/" + a_id + "/messages/" + message_id + "/files/" + file + "/download", "{}").status == 200);
+    CHECK(until([&] { return bob.json("GET", "/api/v1/files/" + file)["state"].asString() == "available"; }, 40000));
+    Reply content = bob.call("GET", "/api/v1/files/" + file + "/content");
+    CHECK(content.status == 200 && content.body == bytes);
+    /* fetched whole by everyone it was for: gone from the Levee */
+    CHECK(until([&] { return lv.ctl("status").find("files waiting for friends: 0") != std::string::npos; }, 20000));
+    CHECK(alice.up());
 
     /* ---- she leaves the Levee ---- */
     CHECK(alice.call("POST", "/api/v1/levee/leave", "{}").status == 204);
