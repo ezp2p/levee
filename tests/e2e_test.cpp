@@ -152,6 +152,30 @@ int main()
     CHECK(until([&] { return has_text(bob, a_id, "hi bob, from behind my levee"); }, 30000));
     CHECK(until([&] { return delivered(alice, b_id, "hi bob, from behind my levee"); }, 30000));
 
+    /* ---- a call: Alice's media goes through her Levee's relay, Bob's straight to it ---- */
+    Reply started = alice.call("POST", "/api/v1/calls/start", "{\"user\":\"" + b_id + "\"}");
+    Json::Value call;
+    CHECK(started.status == 201 && parse_object(started.body, call));
+    std::string call_id = call["id"].asString();
+    std::string incoming;
+    CHECK(until([&] {
+        Json::Value calls = bob.json("GET", "/api/v1/calls");
+        for (const Json::Value &c : calls["items"])
+            if (c["direction"].asString() == "incoming" && c["state"].asString() == "ringing")
+                incoming = c["id"].asString();
+        return !incoming.empty();
+    }, 30000));
+    CHECK(bob.call("POST", "/api/v1/calls/" + incoming + "/accept", "{}").status < 300);
+    auto active = [&](Node &n, const std::string &id) {
+        Json::Value c = n.json("GET", "/api/v1/calls/" + id);
+        return c["state"].asString() == "active" && c["media"].asBool();
+    };
+    CHECK(until([&] { return active(alice, call_id) && active(bob, incoming); }, 30000));
+    if (!active(alice, call_id))
+        fprintf(stderr, "alice's call: %s\n", alice.call("GET", "/api/v1/calls/" + call_id).body.c_str());
+    CHECK(alice.call("POST", "/api/v1/calls/" + call_id + "/end", "{}").status < 300);
+    CHECK(until([&] { return bob.json("GET", "/api/v1/calls/" + incoming)["state"].asString() == "ended"; }, 20000));
+
     /* ---- Alice is away: the Levee takes what Bob sends, and Bob counts it delivered ---- */
     /* Bob knows which Levee answers for her (it came with her answer to his request) */
     CHECK(run_out("grep -rl levee_id " + bob.dir + "/data/state/streams").find(a_id) != std::string::npos);
