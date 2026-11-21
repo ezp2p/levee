@@ -1,0 +1,22 @@
+# A Levee for your Puddle (README.md, "With Docker"):
+#
+#   LEVEE_ADDRESS=levee.example.org docker compose up -d
+#   docker compose exec levee leveectl join        # the levee://… link: paste it in your Puddle (Settings, Levee)
+#
+# HTTPS is on 127.0.0.1:8443 for a reverse proxy on this host to forward to; publish it on 0.0.0.0 to go without one.
+# The relay for calls is UDP and is published directly.
+services:
+  levee:
+    image: ghcr.io/ezp2p/levee:${LEVEE_TAG:-dev}
+    restart: unless-stopped
+    environment:
+      LEVEE_ADDRESS: ${LEVEE_ADDRESS:?set LEVEE_ADDRESS, how others reach your Puddle}
+      LEVEE_PUBLIC_IP: ${LEVEE_PUBLIC_IP:-}
+    ports:
+      - "127.0.0.1:8443:8443"
+      - "3478:3478/udp"
+      - "49160-49199:49160-49199/udp"
+    volumes:
+      - levee:/data
+volumes:
+  levee:
