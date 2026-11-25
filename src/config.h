@@ -31,7 +31,8 @@ struct Config {
     std::string data_dir;
     unsigned threads = 2;
     uint64_t spool_max_bytes = 1ull << 30;  /* what waits for the Puddle while it is away */
-    int spool_keep_days = 30;
+    double spool_keep_days = 30; /* then given up, and the sender and the Puddle told (spec/06, "When the Levee gives up") */
+    int64_t spool_keep_ms() const { return (int64_t)(spool_keep_days * 24 * 3600 * 1000); }
     uint64_t file_max_bytes = 100ull << 20; /* the largest file the Puddle may leave here */
     uint64_t files_max_bytes = 4ull << 30;  /* all of them together */
     int files_keep_days = 30;

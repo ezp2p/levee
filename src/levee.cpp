@@ -116,7 +116,7 @@ static bool one_way_route(const std::string &method, const std::string &path)
         return false;
     static const char *const exact[] = { "/stream/v1/address", "/stream/v1/access", "/stream/v1/access/result", "/stream/v1/close",
                                          "/stream/v1/events",  "/stream/v1/profile", "/stream/v1/group/invite",
-                                         "/stream/v1/call/end", "/stream/v1/call/group/leave" };
+                                         "/stream/v1/call/end", "/stream/v1/call/group/leave", "/stream/v1/undelivered" };
     for (const char *e : exact)
         if (path == e)
             return true;
@@ -278,6 +278,20 @@ void Levee::incoming(const HttpRequestPtr &req, Callback &&cb)
             if (debug_log())
                 LOG_INFO << m << " " << path << " from " << sig.id << ": " << (int)a << (attached_now(now) ? ", the Puddle is here" : ", the Puddle is away");
         }
+        /* a friend's Levee telling the Puddle it gave up on something of the Puddle's (spec/06, "When the Levee gives up") */
+        unsigned char lk[32];
+        if (!ok && known == store_.peers().end() && m == "POST" && path == "/stream/v1/undelivered" && store_.peer_levee(sig.id, lk)) {
+            struct Look {
+                const unsigned char *pub;
+            } look = { lk };
+            auto lookup = [](void *u, const char *, const char *, unsigned char out[32]) -> int {
+                memcpy(out, ((Look *)u)->pub, 32);
+                return 1;
+            };
+            pp_authn a = pp_reqsig_authenticate(sig_header.c_str(), m.c_str(), target.c_str(), req->body().data(), req->body().size(),
+                                                j.puddle.c_str(), lookup, &look, nullptr, now, nullptr);
+            ok = a == PP_AUTHN_OK || a == PP_AUTHN_SKEW;
+        }
         if (!ok && first_contact_route(m, path)) {
             std::string ip = client_address(cfg_.trusted_proxies, req->peerAddr().toIp(), req->getHeader("x-forwarded-for"));
             auto b = stranger_ips_.try_emplace(ip, 10, 6000).first;
@@ -289,6 +303,11 @@ void Levee::incoming(const HttpRequestPtr &req, Callback &&cb)
             if (debug_log()) LOG_INFO << "refused " << m << " " << path << " from " << sig.id << (known == store_.peers().end() ? " (not a peer)" : " (signature)");
             return cb(not_found());
         }
+
+        /* they are up: what we owe them is tried now */
+        for (Notice &no : store_.notices())
+            if (no.sender == sig.id && no.next > now)
+                no.next = now;
 
         Item it;
         it.n = store_.next_n();
@@ -367,6 +386,16 @@ Json::Value Levee::items_after(uint64_t after, bool &any)
             v["file_done"]["file"] = fd.first;
             v["file_done"]["by"] = fd.second;
             by_n[n] = v;
+        }
+    for (const Dropped &d : store_.dropped())
+        if (d.n > after) {
+            Json::Value v;
+            v["n"] = (Json::UInt64)d.n;
+            v["dropped"]["from"] = d.from;
+            v["dropped"]["target"] = d.target;
+            v["dropped"]["received"] = (Json::Int64)d.received;
+            v["dropped"]["nonce"] = d.nonce;
+            by_n[d.n] = v;
         }
     for (auto &[n, v] : by_n) {
         items.append(v);
@@ -477,7 +506,9 @@ void Levee::attach(const HttpRequestPtr &req, Callback &&cb)
             return cb(not_found());
         if (!same) { /* a new Puddle: nothing of the old one's stays */
             LOG_INFO << "joined by the Puddle " << sig.id << (j.puddle.empty() ? "" : ", replacing " + j.puddle);
-            store_.drop_spool();
+            give_up(store_.take_spool(), j.puddle, false); /* before the old one's peers go: they say whom to tell */
+            store_.dropped().clear();
+            store_.save_given_up();
             store_.drop_files();
             store_.clear_peers();
             for (auto &[n, w] : live_)
@@ -529,9 +560,11 @@ void Levee::detach(const HttpRequestPtr &req, Callback &&cb)
             return cb(not_found());
         LOG_INFO << "the Puddle " << store_.join().puddle << " left";
         Join &j = store_.join();
+        give_up(store_.take_spool(), j.puddle, false); /* before its peers go: they say whom to tell */
+        store_.dropped().clear();
+        store_.save_given_up();
         j = Join{};
         store_.save_join();
-        store_.drop_spool();
         store_.drop_files();
         store_.clear_peers();
         have_puddle_ = false;
@@ -582,6 +615,11 @@ void Levee::inbox(const HttpRequestPtr &req, Callback &&cb)
     store_.drop_spooled_upto(after);
     while (!notices_.empty() && notices_.front().first <= after)
         notices_.pop_front();
+    auto &dr = store_.dropped();
+    size_t before = dr.size();
+    dr.erase(std::remove_if(dr.begin(), dr.end(), [after](const Dropped &d) { return d.n <= after; }), dr.end());
+    if (dr.size() != before)
+        store_.save_given_up();
     /* one waiting at a time: an older request is answered empty */
     for (Poll &p : polls_)
         p.cb(json_answer(200, Json::Value(Json::objectValue)));
@@ -823,6 +861,164 @@ void Levee::file_done(const HttpRequestPtr &req, const std::string &file, Callba
     cb(status_only(204));
 }
 
+/* ---------------------------------------------------------------- giving up (spec/06, "When the Levee gives up") */
+
+void Levee::give_up(const std::vector<GivenUp> &what, const std::string &for_id, bool tell_puddle)
+{
+    int64_t now = wall_ms();
+    bool changed = false;
+    for (const GivenUp &g : what) {
+        if (tell_puddle) {
+            Dropped d;
+            d.n = store_.next_n();
+            d.from = g.sender;
+            d.target = g.target;
+            d.nonce = g.nonce;
+            d.received = g.received;
+            store_.dropped().push_back(d);
+            changed = true;
+        }
+        /* the sender, if the Puddle told us where they are; a first contact (a stranger) isn't told */
+        const PeerInfo *p = store_.peer(g.sender);
+        if (!p || !p->has_seal || p->addresses.empty() || for_id.empty() || g.sha256.empty())
+            continue;
+        Notice *no = nullptr;
+        for (Notice &n : store_.notices())
+            if (n.sender == g.sender && n.for_id == for_id)
+                no = &n;
+        if (!no) {
+            Notice n;
+            n.sender = g.sender;
+            n.for_id = for_id;
+            n.given_up = now;
+            store_.notices().push_back(n);
+            no = &store_.notices().back();
+        }
+        no->seal = base64(p->seal.data(), 32);
+        no->addresses = p->addresses;
+        no->items.push_back(g);
+        no->next = now;
+        changed = true;
+    }
+    if (changed && !store_.save_given_up())
+        LOG_WARN << "could not save undelivered.json";
+}
+
+/* how long until the next try, as a Puddle's outbox waits for someone away: five minutes for a day, then half an hour */
+static int64_t notice_retry_ms(int64_t given_up, int64_t now)
+{
+    return now - given_up < 24 * 3600 * 1000LL ? 5 * 60 * 1000LL : 30 * 60 * 1000LL;
+}
+
+void Levee::send_notices(int64_t now)
+{
+    if (stopping_)
+        return;
+    pp_signer s;
+    pp_signer_from_seed(&s, key_.id.c_str(), key_.seed);
+    for (Notice &no : store_.notices()) {
+        std::string tag = no.sender + "\n" + no.for_id;
+        if (no.next > now || notifying_.count(tag))
+            continue;
+        unsigned char seal[32];
+        if (!unbase64(no.seal, seal, 32) || no.addresses.empty())
+            continue;
+        Json::Value body;
+        body["for"] = no.for_id;
+        body["levee"] = key_.id;
+        body["items"] = Json::arrayValue;
+        size_t count = 0;
+        for (const GivenUp &g : no.items) {
+            char sig[100];
+            if (pp_undelivered_sign(&s, no.for_id.c_str(), g.nonce.c_str(), g.sha256.c_str(), sig, sizeof sig) != 0)
+                continue;
+            Json::Value i;
+            i["nonce"] = g.nonce;
+            i["sha256"] = g.sha256;
+            i["received"] = (Json::Int64)g.received;
+            i["sig"] = sig;
+            body["items"].append(i);
+            if (++count == 256) /* one notice at a time is enough for anyone; the rest go next */
+                break;
+        }
+        std::string plain = to_json(body);
+        /* sealed to them, and signed by this Levee under its own id: sealing needs a sender and a nonce, and the signature
+         * is how their Levee knows it is ours. Each item's sig is the proof that counts. */
+        pp_sealed_request sr;
+        if (pp_seal_request(&s, "POST", "/stream/v1/undelivered", plain.data(), plain.size(), no.sender.c_str(), seal, now, &sr) != 0)
+            continue;
+        std::string sealed(sr.body ? (const char *)sr.body : "", sr.body_len), signature = sr.signature, seal_header = sr.seal;
+        pp_sealed_request_free(&sr);
+        no.attempts++;
+        no.next = now + notice_retry_ms(no.given_up, now);
+        notifying_.insert(tag);
+
+        /* each address in turn, until one takes it */
+        struct Try {
+            Levee *self;
+            std::vector<std::string> addresses;
+            size_t at = 0;
+            std::string sender, for_id, body, signature, seal;
+            size_t items;
+        };
+        auto t = std::make_shared<Try>(Try{ this, no.addresses, 0, no.sender, no.for_id, sealed, signature, seal_header, count });
+        auto attempt = std::make_shared<std::function<void()>>();
+        *attempt = [t, attempt, loop = loop_]() {
+            if (t->at >= t->addresses.size()) {
+                t->self->notice_sent(t->sender, t->for_id, t->items, false);
+                return;
+            }
+            std::string to = t->addresses[t->at++];
+            std::string host = address_host(to);
+            if (undialable(host))
+                return (*attempt)();
+            auto client = drogon::HttpClient::newHttpClient("https://" + address_with_port(to), loop, false, false);
+            auto out = drogon::HttpRequest::newHttpRequest();
+            out->setMethod(drogon::Post);
+            out->setPathEncode(false);
+            out->setPath("/stream/v1/undelivered");
+            out->addHeader("X-Puddle-Signature", t->signature);
+            out->addHeader("X-Puddle-Seal", t->seal);
+            out->setContentTypeString(PP_SEALED_TYPE);
+            out->setBody(t->body);
+            client->setUserAgent("");
+            client->sendRequest(
+                out,
+                [t, attempt, client](drogon::ReqResult r, const HttpResponsePtr &resp) {
+                    /* taken: by them (204), or by their Levee for them (202) */
+                    int st = r == drogon::ReqResult::Ok && resp ? (int)resp->statusCode() : 0;
+                    if (st == 204 || st == 202)
+                        t->self->notice_sent(t->sender, t->for_id, t->items, true);
+                    else
+                        (*attempt)();
+                },
+                20.0);
+        };
+        LOG_INFO << "telling " << no.sender.substr(0, 12) << "… we gave up on " << count << " request" << (count == 1 ? "" : "s") << " of theirs";
+        loop_->queueInLoop([attempt] { (*attempt)(); });
+    }
+}
+
+void Levee::notice_sent(const std::string &sender, const std::string &for_id, size_t items, bool ok)
+{
+    std::lock_guard<std::mutex> g(mu_);
+    notifying_.erase(sender + "\n" + for_id);
+    if (!ok)
+        return;
+    auto &ns = store_.notices();
+    for (auto it = ns.begin(); it != ns.end(); ++it)
+        if (it->sender == sender && it->for_id == for_id) {
+            it->items.erase(it->items.begin(), it->items.begin() + (long)std::min(items, it->items.size()));
+            if (it->items.empty())
+                ns.erase(it);
+            else
+                it->next = wall_ms();
+            break;
+        }
+    store_.save_given_up();
+    LOG_INFO << "told " << sender.substr(0, 12) << "… what we gave up on";
+}
+
 /* ---------------------------------------------------------------- time */
 
 void Levee::tick()
@@ -859,10 +1055,26 @@ void Levee::tick()
             }
         }
         polls_ = std::move(still);
+        /* the spool's limits, every few seconds (it is in memory); what runs out is given up, and said so */
+        if (now - last_give_up_check_ >= 5000) {
+            last_give_up_check_ = now;
+            std::vector<GivenUp> old = store_.trim_spool(cfg_.spool_max_bytes, now - cfg_.spool_keep_ms());
+            if (!old.empty()) {
+                LOG_INFO << "gave up on " << old.size() << " request" << (old.size() == 1 ? "" : "s") << " the Puddle didn't come back for";
+                give_up(old, store_.join().puddle, true);
+                wake_polls(later);
+            }
+            /* a notice nobody took within the spool's time is forgotten */
+            auto &ns = store_.notices();
+            size_t had = ns.size();
+            ns.erase(std::remove_if(ns.begin(), ns.end(), [&](const Notice &no) { return now - no.given_up > cfg_.spool_keep_ms(); }), ns.end());
+            if (ns.size() != had)
+                store_.save_given_up();
+        }
+        send_notices(now);
         static int64_t last_trim = 0;
         if (now - last_trim > 60 * 1000) {
             last_trim = now;
-            store_.trim_spool(cfg_.spool_max_bytes, now - (int64_t)cfg_.spool_keep_days * 24 * 3600 * 1000);
             for (const FileMeta &f : store_.files())
                 if (f.created && now - f.created > (int64_t)cfg_.files_keep_days * 24 * 3600 * 1000)
                     store_.remove_file(f.id);

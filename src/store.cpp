@@ -8,7 +8,6 @@
 #include <cstring>
 #include <dirent.h>
 #include <filesystem>
-#include <sys/stat.h>
 
 namespace fs = std::filesystem;
 
@@ -97,18 +96,79 @@ bool Store::open(const std::string &dir, std::string &err)
         uint64_t n = strtoull(name.c_str(), nullptr, 10);
         if (!n)
             continue;
-        uint64_t size = (uint64_t)e.file_size(ec);
-        spooled_[n] = size;
-        spool_bytes_ += size;
-        next_n_ = std::max(next_n_, n + 1);
+        Spooled sp;
+        sp.bytes = (uint64_t)e.file_size(ec);
+        sp.what.n = n;
         Json::Value it;
         if (read_file(e.path().string(), text) && parse_object(text, it)) {
-            std::string key = it.get("sender", "").asString() + ":" + it.get("nonce", "").asString();
-            spool_nonces_.insert(key);
-            spool_nonce_of_[n] = key;
+            sp.what.sender = it.get("sender", "").asString();
+            sp.what.nonce = it.get("nonce", "").asString();
+            sp.what.target = it.get("target", "").asString();
+            sp.what.received = it.get("received", 0).asInt64();
+            sp.what.sha256 = it.get("sha256", "").asString();
+            std::string body;
+            if (sp.what.sha256.empty() && unbase64_any(it.get("body", "").asString(), body)) /* kept before it was saved */
+                sp.what.sha256 = sha256_hex(body);
+            spool_nonces_.insert(sp.what.sender + ":" + sp.what.nonce);
+        }
+        spool_bytes_ += sp.bytes;
+        next_n_ = std::max(next_n_, n + 1);
+        spooled_[n] = std::move(sp);
+    }
+    /* numbers carry on from the last ones handed out, even with nothing kept: the Puddle's inbox says what it took by number */
+    if (read_file(dir + "/next_n", text)) {
+        uint64_t n = strtoull(text.c_str(), nullptr, 10);
+        next_n_ = std::max(next_n_, n);
+        reserved_n_ = n;
+    }
+    /* what was given up on and not yet told */
+    if (read_file(dir + "/undelivered.json", text) && parse_object(text, j)) {
+        for (const Json::Value &v : j["notices"]) {
+            Notice no;
+            no.sender = v.get("sender", "").asString();
+            no.for_id = v.get("for", "").asString();
+            no.seal = v.get("seal", "").asString();
+            for (const Json::Value &a : v["addresses"])
+                if (a.isString())
+                    no.addresses.push_back(a.asString());
+            no.given_up = v.get("given_up", 0).asInt64();
+            no.next = v.get("next", 0).asInt64();
+            no.attempts = v.get("attempts", 0).asInt();
+            for (const Json::Value &i : v["items"]) {
+                GivenUp g;
+                g.nonce = i.get("nonce", "").asString();
+                g.sha256 = i.get("sha256", "").asString();
+                g.received = i.get("received", 0).asInt64();
+                g.sender = no.sender;
+                no.items.push_back(g);
+            }
+            if (!no.sender.empty() && !no.items.empty())
+                notices_.push_back(std::move(no));
+        }
+        for (const Json::Value &v : j["dropped"]) {
+            Dropped d;
+            d.n = v.get("n", 0).asUInt64();
+            d.from = v.get("from", "").asString();
+            d.target = v.get("target", "").asString();
+            d.nonce = v.get("nonce", "").asString();
+            d.received = v.get("received", 0).asInt64();
+            if (d.n) {
+                next_n_ = std::max(next_n_, d.n + 1);
+                dropped_.push_back(std::move(d));
+            }
         }
     }
     return true;
+}
+
+uint64_t Store::next_n()
+{
+    if (next_n_ >= reserved_n_) {
+        uint64_t r = next_n_ + 1024;
+        if (write_file(dir_ + "/next_n", std::to_string(r) + "\n"))
+            reserved_n_ = r;
+    }
+    return next_n_++;
 }
 
 bool Store::save_join()
@@ -123,6 +183,65 @@ bool Store::save_join()
     return write_file(dir_ + "/join.json", to_json(j) + "\n", true);
 }
 
+bool Store::save_given_up()
+{
+    if (notices_.empty() && dropped_.empty()) {
+        std::error_code ec;
+        fs::remove(dir_ + "/undelivered.json", ec);
+        return true;
+    }
+    Json::Value j;
+    j["notices"] = Json::arrayValue;
+    for (const Notice &no : notices_) {
+        Json::Value v;
+        v["sender"] = no.sender;
+        v["for"] = no.for_id;
+        v["seal"] = no.seal;
+        v["addresses"] = Json::arrayValue;
+        for (const std::string &a : no.addresses)
+            v["addresses"].append(a);
+        v["given_up"] = (Json::Int64)no.given_up;
+        v["next"] = (Json::Int64)no.next;
+        v["attempts"] = no.attempts;
+        v["items"] = Json::arrayValue;
+        for (const GivenUp &g : no.items) {
+            Json::Value i;
+            i["nonce"] = g.nonce;
+            i["sha256"] = g.sha256;
+            i["received"] = (Json::Int64)g.received;
+            v["items"].append(i);
+        }
+        j["notices"].append(v);
+    }
+    j["dropped"] = Json::arrayValue;
+    for (const Dropped &d : dropped_) {
+        Json::Value v;
+        v["n"] = (Json::UInt64)d.n;
+        v["from"] = d.from;
+        v["target"] = d.target;
+        v["nonce"] = d.nonce;
+        v["received"] = (Json::Int64)d.received;
+        j["dropped"].append(v);
+    }
+    return write_file(dir_ + "/undelivered.json", to_json(j) + "\n", true);
+}
+
+const PeerInfo *Store::peer(const std::string &id) const
+{
+    auto it = peer_info_.find(id);
+    return it == peer_info_.end() ? nullptr : &it->second;
+}
+
+bool Store::peer_levee(const std::string &levee_id, unsigned char key[32]) const
+{
+    for (const auto &[id, p] : peer_info_)
+        if (!p.levee_id.empty() && p.levee_id == levee_id) {
+            memcpy(key, p.levee_key.data(), 32);
+            return true;
+        }
+    return false;
+}
+
 bool Store::set_peers(const std::string &json, std::string &err)
 {
     Json::Value j;
@@ -131,6 +250,7 @@ bool Store::set_peers(const std::string &json, std::string &err)
         return false;
     }
     std::map<std::string, std::array<unsigned char, 32>> keys;
+    std::map<std::string, PeerInfo> info;
     for (const Json::Value &p : j["peers"]) {
         if (!p.isObject() || !p["id"].isString() || !p["chain"].isString())
             continue;
@@ -142,6 +262,25 @@ bool Store::set_peers(const std::string &json, std::string &err)
         std::array<unsigned char, 32> k;
         memcpy(k.data(), h.sign_pub, 32);
         keys[id] = k;
+        /* where they are and which Levee answers for them: only to tell them we gave up on something of theirs */
+        PeerInfo pi;
+        pi.key = k;
+        memcpy(pi.seal.data(), h.enc_pub, 32);
+        pi.has_seal = true;
+        for (const Json::Value &a : p["addresses"])
+            if (a.isString() && !a.asString().empty() && a.asString().size() < 300 && pi.addresses.size() < 8)
+                pi.addresses.push_back(a.asString());
+        const Json::Value &lv = p["levee"];
+        unsigned char lk[32];
+        char want[PP_ID_LEN + 1];
+        if (lv.isObject() && lv["id"].isString() && lv["key"].isString() && unbase64(lv["key"].asString(), lk, 32)) {
+            pp_key_id_b32(PP_LABEL_LEVEE, lk, want);
+            if (lv["id"].asString() == want) {
+                pi.levee_id = want;
+                memcpy(pi.levee_key.data(), lk, 32);
+            }
+        }
+        info[id] = std::move(pi);
     }
     for (const Json::Value &d : j["devices"]) {
         if (!d.isObject() || !d["id"].isString() || !d["key"].isString())
@@ -156,6 +295,7 @@ bool Store::set_peers(const std::string &json, std::string &err)
         keys[id] = k;
     }
     peer_keys_ = std::move(keys);
+    peer_info_ = std::move(info);
     if (!write_file(dir_ + "/peers.json", json, true)) {
         err = "could not write peers.json";
         return false;
@@ -166,6 +306,7 @@ bool Store::set_peers(const std::string &json, std::string &err)
 void Store::clear_peers()
 {
     peer_keys_.clear();
+    peer_info_.clear();
     std::error_code ec;
     fs::remove(dir_ + "/peers.json", ec);
 }
@@ -187,15 +328,23 @@ bool Store::spool(const Item &it)
     j["content_type"] = it.content_type;
     j["sender"] = it.sender;
     j["nonce"] = it.nonce;
+    std::string hash = sha256_hex(it.body);
+    j["sha256"] = hash;
     j["body"] = base64((const unsigned char *)it.body.data(), it.body.size());
     std::string text = to_json(j) + "\n";
     if (!write_file(spool_path(dir_, it.n), text, true))
         return false;
-    spooled_[it.n] = text.size();
+    Spooled sp;
+    sp.bytes = text.size();
+    sp.what.n = it.n;
+    sp.what.sender = it.sender;
+    sp.what.nonce = it.nonce;
+    sp.what.sha256 = hash;
+    sp.what.target = it.target;
+    sp.what.received = it.received;
+    spooled_[it.n] = std::move(sp);
     spool_bytes_ += text.size();
-    std::string key = it.sender + ":" + it.nonce;
-    spool_nonces_.insert(key);
-    spool_nonce_of_[it.n] = key;
+    spool_nonces_.insert(it.sender + ":" + it.nonce);
     return true;
 }
 
@@ -229,42 +378,47 @@ std::vector<Item> Store::spooled_after(uint64_t after, size_t max_items, size_t 
     return out;
 }
 
-void Store::drop_spooled_upto(uint64_t n)
+void Store::drop_one(std::map<uint64_t, Spooled>::iterator it)
 {
     std::error_code ec;
-    while (!spooled_.empty() && spooled_.begin()->first <= n) {
-        auto it = spooled_.begin();
-        fs::remove(spool_path(dir_, it->first), ec);
-        spool_bytes_ -= std::min(spool_bytes_, it->second);
-        auto k = spool_nonce_of_.find(it->first);
-        if (k != spool_nonce_of_.end()) {
-            spool_nonces_.erase(k->second);
-            spool_nonce_of_.erase(k);
-        }
-        spooled_.erase(it);
-    }
+    fs::remove(spool_path(dir_, it->first), ec);
+    spool_bytes_ -= std::min(spool_bytes_, it->second.bytes);
+    spool_nonces_.erase(it->second.what.sender + ":" + it->second.what.nonce);
+    spooled_.erase(it);
+}
+
+void Store::drop_spooled_upto(uint64_t n)
+{
+    while (!spooled_.empty() && spooled_.begin()->first <= n)
+        drop_one(spooled_.begin());
 }
 
 void Store::drop_spool()
 {
-    if (!spooled_.empty())
-        drop_spooled_upto(spooled_.rbegin()->first);
+    while (!spooled_.empty())
+        drop_one(spooled_.begin());
 }
 
-void Store::trim_spool(uint64_t max_bytes, int64_t before_ms)
+std::vector<GivenUp> Store::take_spool()
 {
-    std::error_code ec;
+    std::vector<GivenUp> out;
+    for (auto &[n, sp] : spooled_)
+        out.push_back(sp.what);
+    drop_spool();
+    return out;
+}
+
+std::vector<GivenUp> Store::trim_spool(uint64_t max_bytes, int64_t before_ms)
+{
+    std::vector<GivenUp> out;
     while (!spooled_.empty()) {
         auto it = spooled_.begin();
-        bool old = false;
-        if (spool_bytes_ <= max_bytes) {
-            struct stat st;
-            old = stat(spool_path(dir_, it->first).c_str(), &st) == 0 && (int64_t)st.st_mtime * 1000 < before_ms;
-            if (!old)
-                break;
-        }
-        drop_spooled_upto(it->first);
+        if (spool_bytes_ <= max_bytes && it->second.what.received >= before_ms)
+            break;
+        out.push_back(it->second.what);
+        drop_one(it);
     }
+    return out;
 }
 
 bool Store::spooled_nonce(const std::string &sender, const std::string &nonce) const

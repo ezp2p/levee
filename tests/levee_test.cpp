@@ -112,6 +112,18 @@ int main()
     Json::Value peers;
     peers["peers"][0]["id"] = friend_.id;
     peers["peers"][0]["chain"] = friend_.chain;
+    /* where the friend is, and their own Levee: whose notices that it gave up on something of ours are taken (spec/06) */
+    unsigned char their_seed[32], their_pub[32], stray_seed[32], stray_pub[32];
+    for (int i = 0; i < 32; i++)
+        their_seed[i] = (unsigned char)(200 + i), stray_seed[i] = (unsigned char)(100 + i);
+    pp_ed25519_public(their_seed, their_pub);
+    pp_ed25519_public(stray_seed, stray_pub);
+    char their_id[PP_ID_LEN + 1], stray_id[PP_ID_LEN + 1];
+    pp_key_id_b32(PP_LABEL_LEVEE, their_pub, their_id);
+    pp_key_id_b32(PP_LABEL_LEVEE, stray_pub, stray_id);
+    peers["peers"][0]["addresses"][0] = "127.0.0.1:1";
+    peers["peers"][0]["levee"]["id"] = their_id;
+    peers["peers"][0]["levee"]["key"] = base64(their_pub, 32);
     peers["devices"] = Json::arrayValue;
     CHECK(puddle_call(lv.port, puddle, levee_id, seal_pk, "POST", "/levee/v1/peers", levee::to_json(peers)).r.status == 204);
     CHECK(puddle_call(lv.port, other, levee_id, seal_pk, "POST", "/levee/v1/peers", levee::to_json(peers)).r.status == 404);
@@ -134,18 +146,30 @@ int main()
     Reply first = https(lv.port, "POST", "/stream/v1/access", acc,
                         { "X-Puddle-Signature: " + stranger.signature("POST", "/stream/v1/access", acc, "*") });
     CHECK(first.status == 202);
+    /* a notice from the friend's Levee, signed under its own id: kept like any one-way request; another Levee's is not */
+    auto levee_notice = [&](const unsigned char seed[32], const char *id) {
+        pp_signer ls;
+        pp_signer_from_seed(&ls, id, seed);
+        std::string b = "{\"sealed\":\"for the Puddle\"}";
+        char h[PP_REQSIG_MAX];
+        pp_reqsig_sign(&ls, "POST", "/stream/v1/undelivered", b.data(), b.size(), puddle.id.c_str(), 0, nullptr, h, sizeof h);
+        return https(lv.port, "POST", "/stream/v1/undelivered", b, { std::string("X-Puddle-Signature: ") + h });
+    };
+    CHECK(levee_notice(stray_seed, stray_id).status == 404);
+    CHECK(levee_notice(their_seed, their_id).status == 202);
 
     /* ---- the Puddle comes: what waited is handed over, and taken ---- */
     Sent in = puddle_call(lv.port, puddle, levee_id, nullptr, "GET", "/levee/v1/inbox?after=0", "");
     CHECK(in.r.status == 200);
     Json::Value inbox;
-    CHECK(parse_object(in.r.body, inbox) && inbox["items"].size() == 2);
+    CHECK(parse_object(in.r.body, inbox) && inbox["items"].size() == 3);
+    CHECK(inbox["items"][2]["target"].asString() == "/stream/v1/undelivered");
     const Json::Value &it0 = inbox["items"][0];
     std::string body0;
     CHECK(!it0["live"].asBool() && it0["method"].asString() == "POST" && it0["target"].asString() == target &&
           it0["headers"]["X-Puddle-Signature"].asString() == sig && unbase64_any(it0["body"].asString(), body0) && body0 == events);
     CHECK(it0["headers"]["Content-Type"].asString() == "application/json");
-    uint64_t last = inbox["items"][1]["n"].asUInt64();
+    uint64_t last = inbox["items"][2]["n"].asUInt64();
     CHECK(puddle_call(lv.port, other, levee_id, nullptr, "GET", "/levee/v1/inbox?after=0", "").r.status == 404);
 
     /* ---- the Puddle is there: a request passes through and the answer comes back as it was ---- */

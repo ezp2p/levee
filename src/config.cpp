@@ -73,10 +73,19 @@ bool load_config(const std::string &path, Config &c, std::string &err)
                     return false;
                 c.spool_max_bytes = (uint64_t)v << 20;
             }
-            if (s["keep_days"]) {
-                if (!unsigned_of(s["keep_days"], "spool.keep_days", 3650, v, err))
+            if (s["keep_days"]) { /* a fraction is taken: 0.5 is twelve hours */
+                double d = -1;
+                try {
+                    d = s["keep_days"].as<double>();
+                } catch (...) {
+                    err = "spool.keep_days: not a number";
                     return false;
-                c.spool_keep_days = (int)v;
+                }
+                if (!(d > 0 && d <= 3650)) {
+                    err = "spool.keep_days: out of range";
+                    return false;
+                }
+                c.spool_keep_days = d;
             }
         }
         if (YAML::Node f = root["files"]) {

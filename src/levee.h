@@ -27,6 +27,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -108,6 +109,12 @@ private:
     drogon::HttpResponsePtr spool_with_custody(const Item &it);
     bool puddle_key(unsigned char pub[32]) const;
     void load_puddle_key();
+    /* Giving up (spec/06, "When the Levee gives up"): each sender who can be reached is owed a notice, and the Puddle is told
+     * on inbox when `tell_puddle`. Locked. */
+    void give_up(const std::vector<GivenUp> &what, const std::string &for_id, bool tell_puddle);
+    /* send the notices that are due, one sender at a time; locked */
+    void send_notices(int64_t now);
+    void notice_sent(const std::string &sender, const std::string &for_id, size_t items, bool ok);
 
     Config cfg_;
     Key key_;
@@ -120,6 +127,8 @@ private:
     std::vector<Poll> polls_;
     std::deque<std::pair<uint64_t, std::pair<std::string, std::string>>> notices_; /* n -> (file, by) */
     int64_t last_poll_ = 0;
+    int64_t last_give_up_check_ = 0;
+    std::set<std::string> notifying_; /* "<sender>\n<for>": a notice on its way now */
     unsigned char puddle_pub_[32] = {};
     bool have_puddle_ = false;
     pp_replay *replay_;
