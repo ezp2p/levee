@@ -40,11 +40,18 @@ int main()
     CHECK(s.join().puddle == "p" && s.join().token == "t");
     auto all = s.spooled_after(0, 10, 1 << 20);
     CHECK(all.size() == 3 && all[1].body == std::string(10, 'b') && all[2].received == 1002);
-    CHECK(s.next_n() == 4); /* numbers carry on */
+    uint64_t n4 = s.next_n();
+    CHECK(n4 >= 4); /* numbers carry on */
     s.drop_spooled_upto(all[0].n);
     CHECK(s.spooled_after(0, 10, 1 << 20).size() == 2 && !s.spooled_nonce("alice", "nonce0"));
-    s.trim_spool(0, 0); /* nothing may stay */
+    std::vector<levee::GivenUp> gone = s.trim_spool(0, 0); /* nothing may stay: given up, and what to say about it */
     CHECK(s.spooled_after(0, 10, 1 << 20).empty() && s.spool_bytes() == 0);
+    CHECK(gone.size() == 2 && gone[0].sender == "alice" && gone[0].nonce == "nonce1" && gone[0].sha256 == sha256_hex(std::string(10, 'b')) &&
+          gone[1].received == 1002 && gone[1].target == "/stream/v1/events");
+    { /* with nothing kept, numbers still never start again: the Puddle says what it took by number */
+        Store again;
+        CHECK(again.open(dir, err) && again.next_n() > n4);
+    }
 
     std::string f = sha256_hex("f");
     CHECK(s.put_piece(f, "hashes", "h", 100, 1000) && s.put_piece(f, "0", std::string(50, 'x'), 100, 1000));

@@ -8,6 +8,9 @@ your Puddle at the Levee's address:
 - **While your Puddle is on**, what they send passes straight through.
 - **While it is off**, what they send that needs no answer (messages, profiles, address changes, friend requests) waits at
   the Levee and is handed over when your Puddle comes back. The sender is told it arrived (a custody receipt the Levee signs).
+  What waits longer than `spool.keep_days` (or is still there when your Puddle leaves) is given up, and both ends are
+  told: the sender, so it counts as not delivered and can be sent again once you are back; your Puddle, so it can tell
+  you something from that friend expired.
 - **What your Puddle sends** goes out through the Levee too, so nobody you talk to learns your home address.
 - **Files you send** wait at the Levee, encrypted under keys it never sees, until each friend has fetched them; then they
   are deleted. A friend who asks again later asks your Puddle, which puts the file there again.
@@ -116,7 +119,7 @@ build/leveed -c levee.yaml
 | `address` | (required) | how others reach your Puddle, `host[:port]`; what its links say |
 | `data_dir` | (required) | the Levee's key, certificate and everything it keeps |
 | `threads` | 2 | |
-| `spool.max_mb`, `spool.keep_days` | 1024, 30 | what waits for your Puddle while it is off; the oldest goes first |
+| `spool.max_mb`, `spool.keep_days` | 1024, 30 | what waits for your Puddle while it is off; the oldest goes first, and what is given up on is said to the sender and your Puddle. `keep_days` may be a fraction (`0.5`: twelve hours) |
 | `files.max_mb`, `files.total_mb`, `files.keep_days` | 100, 4096, 30 | files left for friends |
 | `trusted_proxies` | none | reverse proxies in front (`[127.0.0.1, 172.16.0.0/12]`): a request from one is taken to come from the address its `X-Forwarded-For` names |
 | `turn.port`, `turn.relay_ports`, `turn.public_ip` | 3478, `49160-49199`, the address's host | the relay for calls (UDP); `turn: false` turns it off |
@@ -134,9 +137,13 @@ build/leveed -c levee.yaml
 
 Plain files, nothing else: `levee.key` (keep it: a new key is a new Levee, and your friends would no longer believe its
 custody receipts until your Puddle tells them), `cert.pem`/`key.pem`, `join.json`, `peers.json` (your friends' public keys,
-so strangers get nowhere), `spool/` and `files/`.
+so strangers get nowhere, and where they are and which Levee answers for them, so they can be told what was given up on),
+`spool/`, `undelivered.json` (notices owed to senders, and what your Puddle is to be told), `next_n` (item numbers only
+grow, across restarts too) and `files/`.
 
 ## Tests
 
 `ctest --test-dir build`: `config` (levee.yaml, and where a request comes from behind a proxy), `store` (the data folder), `turn` (the relay, as a TURN client and a peer meet it) and `levee`
-(leveed as a Puddle and its friends meet it: joining, spooling, passing through, sending, files, leaving).
+(leveed as a Puddle and its friends meet it: joining, spooling, passing through, a notice from a friend's Levee, sending,
+files, leaving). `e2e` puts a real `puddled` behind it (`-DPUDDLED=<path>`; skipped without one), including a message the
+Levee gives up on, which both Puddles are told about and the sender sends again.

@@ -1,7 +1,8 @@
 /* Two real Puddles (puddled, a separate program: PUDDLED in CMakeLists.txt), Alice behind a real Levee, over TLS on this machine:
  * Alice joins with the link leveectl makes; her address becomes the Levee's; Bob asks for a stream at it; they talk, Alice's
  * side going out through the Levee; Alice stops, and what Bob sends meanwhile is taken by the Levee (Bob counts it delivered)
- * and reaches Alice when she comes back; Alice leaves the Levee. Skipped (77) without a puddled. */
+ * and reaches Alice when she comes back; then the Levee gives up on one (its keep_days run out) and tells both of them, and Bob
+ * sends it again once Alice is back; Alice leaves the Levee. Skipped (77) without a puddled. */
 
 #include "harness.h"
 
@@ -109,6 +110,25 @@ static bool delivered(Node &n, const std::string &with, const std::string &t)
         if (m.isMember("body") && m["body"].asString() == t)
             return !m.isMember("delivery");
     return false;
+}
+
+/* the delivery of the owner's own message `t`: its state ("" when delivered), and whether they are back */
+static Json::Value delivery_of(Node &n, const std::string &with, const std::string &t)
+{
+    Json::Value page = n.json("GET", "/api/v1/conversations/" + with + "/messages?limit=50");
+    for (const Json::Value &m : page["items"])
+        if (m.isMember("body") && m["body"].asString() == t)
+            return m.isMember("delivery") ? m["delivery"] : Json::Value(Json::objectValue);
+    return Json::Value(Json::nullValue);
+}
+
+static std::string id_of_message(Node &n, const std::string &with, const std::string &t)
+{
+    Json::Value page = n.json("GET", "/api/v1/conversations/" + with + "/messages?limit=50");
+    for (const Json::Value &m : page["items"])
+        if (m.isMember("body") && m["body"].asString() == t)
+            return m["id"].asString();
+    return "";
 }
 
 int main()
@@ -230,6 +250,47 @@ int main()
     /* fetched whole by everyone it was for: gone from the Levee */
     CHECK(until([&] { return lv.ctl("status").find("files waiting for friends: 0") != std::string::npos; }, 20000));
     CHECK(alice.up());
+
+    /* ---- the Levee gives up on what Bob sent while she was away, and says so to both (spec/06, "When the Levee gives up") ---- */
+    lv.stop();
+    { /* keep things for 0.0002 days (17 seconds) */
+        FILE *f = fopen(lv.yaml.c_str(), "a");
+        fputs("spool:\n  keep_days: 0.0002\n", f);
+        fclose(f);
+    }
+    CHECK(lv.start());
+    CHECK(until([&] { return alice.json("GET", "/api/v1/levee")["attached"].asBool(); }, 60000));
+    alice.down();
+    const std::string lost = "this one waits too long";
+    CHECK(bob.call("POST", "/api/v1/conversations/" + a_id + "/messages/send", "{\"body\":\"" + lost + "\"}").status < 300);
+    CHECK(until([&] { return delivered(bob, a_id, lost); }, 40000)); /* the custody receipt: delivered, for now */
+    /* the Levee gives up on it, and tells Bob: not delivered, and not tried again by itself */
+    CHECK(until([&] { return delivery_of(bob, a_id, lost)["state"].asString() == "undelivered"; }, 60000));
+    Json::Value d = delivery_of(bob, a_id, lost);
+    CHECK(!d["back"].asBool());
+    std::string lost_id = id_of_message(bob, a_id, lost);
+    CHECK(lost_id.size() == 64);
+    CHECK(bob.call("POST", "/api/v1/conversations/" + a_id + "/messages/" + lost_id + "/resend", "{}").status == 409); /* not back yet */
+    CHECK(lv.ctl("status").find("waiting for the Puddle: 0 ") != std::string::npos);
+    /* Alice comes back and is told something from Bob expired before she did; she never sees what */
+    CHECK(alice.up());
+    CHECK(until([&] {
+        Json::Value st = alice.json("GET", "/api/v1/levee");
+        for (const Json::Value &x : st["dropped"])
+            if (x["from"].asString() == b_id && x["target"].asString() == "/stream/v1/events")
+                return true;
+        return false;
+    }, 40000));
+    CHECK(!has_text(alice, b_id, lost));
+    /* once Bob hears from her, it may go again: the same message, as a new request */
+    CHECK(alice.call("POST", "/api/v1/conversations/" + b_id + "/messages/send", "{\"body\":\"back again\"}").status < 300);
+    CHECK(until([&] { return has_text(bob, a_id, "back again"); }, 30000));
+    CHECK(until([&] { return delivery_of(bob, a_id, lost)["back"].asBool(); }, 20000));
+    CHECK(bob.call("POST", "/api/v1/conversations/" + a_id + "/messages/" + lost_id + "/resend", "{}").status == 200);
+    CHECK(until([&] { return has_text(alice, b_id, lost); }, 30000));
+    CHECK(until([&] { return delivered(bob, a_id, lost); }, 30000));
+    CHECK(alice.call("POST", "/api/v1/levee/dropped/clear", "{}").status == 200);
+    CHECK(alice.json("GET", "/api/v1/levee")["dropped"].size() == 0);
 
     /* ---- she leaves the Levee ---- */
     CHECK(alice.call("POST", "/api/v1/levee/leave", "{}").status == 204);
