@@ -1,149 +1,41 @@
 # levee
 
-The public side of one Puddle. Your Puddle connects **out** to its Levee and needs no open ports; everyone else reaches
-your Puddle at the Levee's address:
-
-- **Friends, phones and new contacts** reach your Puddle at the Levee's address, which stays the same when your home
-  network changes.
-- **While your Puddle is on**, what they send passes straight through.
-- **While it is off**, what they send that needs no answer (messages, profiles, address changes, friend requests) waits at
-  the Levee and is handed over when your Puddle comes back. The sender is told it arrived (a custody receipt the Levee signs).
-  What waits longer than `spool.keep_days` (or is still there when your Puddle leaves) is given up, and both ends are
-  told: the sender, so it counts as not delivered and can be sent again once you are back; your Puddle, so it can tell
-  you something from that friend expired.
-- **What your Puddle sends** goes out through the Levee too, so nobody you talk to learns your home address.
-- **Files you send** wait at the Levee, encrypted under keys it never sees, until each friend has fetched them; then they
-  are deleted. A friend who asks again later asks your Puddle, which puts the file there again.
-- **Calls** go through the Levee's relay (a small TURN server), since nothing can reach your Puddle by UDP either.
-
-**Your chats stay on your Puddle.** Everything the Levee carries is sealed end to end, or encrypted under a key it doesn't
-have, and it signs nothing in your name. It does see what any carrier sees: who talks to your Puddle, when and how much.
-Run it yourself, or have someone you trust run it.
+The public side of one Puddle. Your Puddle connects **out** to its Levee and needs no open ports. Everyone else
+reaches your Puddle at the Levee's address. While your Puddle is on, what they send passes straight through. While it
+is off, what needs no answer waits at the Levee and is handed over when it comes back. Everything the Levee carries is
+sealed end to end, and it signs nothing in your name.
 
 One Levee serves one Puddle. It is a headless daemon with a config file and a data folder: no database, no app.
 
-## The protocol
+## Docs
 
-A Levee speaks the Puddle Protocol (`ezp2p/protocol`, here as the submodule `third_party/protocol`): part 06 is the
-Levee's own, and it uses the protocol's library, **libpuddle-proto** (`third_party/protocol/lib`), for ids, key chains,
-signatures, receipts and sealing, as Puddle and Pond do.
+On the website wiki:
 
-## Setting up
+- [Installation](https://www.ezp2p.org/wiki/levee/installation/): with Docker or building it yourself, its ports, and
+  running behind a reverse proxy (Apache and nginx)
+- [Binding a Levee](https://www.ezp2p.org/wiki/levee/binding/): joining it to your Puddle
+- [Reference](https://www.ezp2p.org/wiki/levee/reference/): what it does, every setting in `levee.yaml`, every
+  `leveectl` command, the data folder and the tests
+- [Protocol part 06](https://www.ezp2p.org/wiki/protocol/levee/): what a Levee says on the wire, and the
+  [decisions](https://www.ezp2p.org/wiki/decisions/levee/) behind it
 
-You need a server with a public address (a VPS will do), and a name for it (`levee.example.org`).
+Work still to do is on the [project board](https://github.com/orgs/ezp2p/projects/1).
 
-### With Docker
+## Quick start
 
 ```sh
 git clone https://github.com/ezp2p/levee && cd levee
 LEVEE_ADDRESS=levee.example.org docker compose up -d
-docker compose exec levee leveectl join
+docker compose exec levee leveectl join     # a levee:// link: paste it into your Puddle, Settings → Levee
 ```
 
-`join` prints a link, `levee://levee.example.org?id=…&k=…&token=…`. In your Puddle: **Settings → Levee**, paste it. The
-link is good once. From then on your Puddle's address is the Levee's, and your friends are told so.
+## Build and test
 
-`compose.yaml` publishes HTTPS on `127.0.0.1:8443` for a reverse proxy on the same server, and the relay's UDP ports
-directly (`3478` and `49160-49199`), since a reverse proxy doesn't carry UDP. Open those UDP ports in the server's
-firewall.
-
-### Behind a reverse proxy
-
-Any certificate works (Let's Encrypt, the proxy's own): the protocol never looks at certificates. Forward everything for the
-Levee's name to leveed's HTTPS port, and let requests wait: your Puddle holds one open for up to 25 seconds, and a friend's
-request waits up to 8 seconds for your Puddle's answer.
-
-Apache:
-
-```apache
-<VirtualHost *:443>
-    ServerName levee.example.org
-    SSLEngine on
-    SSLCertificateFile    /etc/letsencrypt/live/example.org/fullchain.pem
-    SSLCertificateKeyFile /etc/letsencrypt/live/example.org/privkey.pem
-
-    SSLProxyEngine on
-    SSLProxyVerify none
-    SSLProxyCheckPeerCN off
-    SSLProxyCheckPeerName off
-    ProxyPreserveHost On
-    ProxyTimeout 75
-    # a container by name: look the name up again now and then (Apache 2.4.60+), or it keeps the old address after a recreate
-    ProxyPass        / https://levee:8443/ nocanon address_ttl=30
-    ProxyPassReverse / https://levee:8443/
-</VirtualHost>
-```
-
-nginx:
-
-```nginx
-location / {
-    proxy_pass https://127.0.0.1:8443;
-    proxy_set_header Host $host;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    proxy_read_timeout 75s;
-    proxy_request_buffering off;
-    client_max_body_size 64m;   # nginx refuses more than 1 MB by default; files go up in 1 MB pieces, plus sealing
-}
-```
-
-Tell leveed which proxies to believe (`trusted_proxies`, below), so it can tell strangers apart: it lets a few first
-contacts through from each address, and without it everyone arrives from the proxy's and shares one allowance. The Docker
-image believes the private ranges, where Docker hands over a proxy's requests, unless `LEVEE_TRUSTED_PROXIES` says otherwise
-(`none` for none). Apache sends `X-Forwarded-For` by itself.
-
-The proxy sees no more than the Levee does: what passes is sealed end to end or signed, so it can neither read it nor
-change it unnoticed. Like the Levee it sees who talks to your Puddle, when and how much.
-
-### Without Docker
-
-Build (needs CMake, a C++20 compiler, OpenSSL 3, jsoncpp and yaml-cpp; Drogon is fetched and built the first time):
+Needs CMake, a C++20 compiler, OpenSSL 3, jsoncpp and yaml-cpp. Drogon is fetched and built the first time. The
+protocol's library, libpuddle-proto, comes from the submodule `third_party/protocol`.
 
 ```sh
 git clone --recurse-submodules https://github.com/ezp2p/levee && cd levee
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --parallel 4
+ctest --test-dir build                       # add -DPUDDLED=<path> at configure time for the end-to-end test
 ```
-
-Copy `levee.yaml.example` to `levee.yaml`, set `address` and `data_dir`, then:
-
-```sh
-build/leveectl -c levee.yaml join
-build/leveed -c levee.yaml
-```
-
-## levee.yaml
-
-| Setting | Default | |
-|---|---|---|
-| `listen`, `port` | `0.0.0.0`, `8443` | where leveed takes HTTPS |
-| `address` | (required) | how others reach your Puddle, `host[:port]`; what its links say |
-| `data_dir` | (required) | the Levee's key, certificate and everything it keeps |
-| `threads` | 2 | |
-| `spool.max_mb`, `spool.keep_days` | 1024, 30 | what waits for your Puddle while it is off; the oldest goes first, and what is given up on is said to the sender and your Puddle. `keep_days` may be a fraction (`0.5`: twelve hours) |
-| `files.max_mb`, `files.total_mb`, `files.keep_days` | 100, 4096, 30 | files left for friends |
-| `trusted_proxies` | none | reverse proxies in front (`[127.0.0.1, 172.16.0.0/12]`): a request from one is taken to come from the address its `X-Forwarded-For` names |
-| `turn.port`, `turn.relay_ports`, `turn.public_ip` | 3478, `49160-49199`, the address's host | the relay for calls (UDP); `turn: false` turns it off |
-
-## leveectl
-
-| | |
-|---|---|
-| `leveectl init` | make the key and certificate; says the Levee's id |
-| `leveectl join` | a link for your Puddle to join with (good once) |
-| `leveectl join --replace` | the same, when another Puddle is joined: the one that joins with it replaces it, and everything kept for the old one goes |
-| `leveectl status` | who is joined, how much waits |
-
-## The data folder
-
-Plain files, nothing else: `levee.key` (keep it: a new key is a new Levee, and your friends would no longer believe its
-custody receipts until your Puddle tells them), `cert.pem`/`key.pem`, `join.json`, `peers.json` (your friends' public keys,
-so strangers get nowhere, and where they are and which Levee answers for them, so they can be told what was given up on),
-`spool/`, `undelivered.json` (notices owed to senders, and what your Puddle is to be told), `next_n` (item numbers only
-grow, across restarts too) and `files/`.
-
-## Tests
-
-`ctest --test-dir build`: `config` (levee.yaml, and where a request comes from behind a proxy), `store` (the data folder), `turn` (the relay, as a TURN client and a peer meet it) and `levee`
-(leveed as a Puddle and its friends meet it: joining, spooling, passing through, a notice from a friend's Levee, sending,
-files, leaving). `e2e` puts a real `puddled` behind it (`-DPUDDLED=<path>`; skipped without one), including a message the
-Levee gives up on, which both Puddles are told about and the sender sends again.
